@@ -1,0 +1,15 @@
+# Core Dependencies
+onnxruntime-gpu>=1.17.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+opencv-python>=4.9.0
+pillow>=10.2.0
+numpy>=1.26.0
+python-multipart>=0.0.9
+
+# RF-DETR Dependencies (para exportación del modelo)
+torch>=2.0.0
+torchvision>=0.15.0
+# Instalar RF-DETR desde GitHub: pip install git+https://github.com/roboflow/rf-detr.git
+onnx>=1.15.0
+onnxsim>=0.4.0
