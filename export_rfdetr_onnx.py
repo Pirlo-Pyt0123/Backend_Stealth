@@ -6,7 +6,7 @@ def main():
     model_name = "rtdetr-l.pt"
 
     print("=" * 60)
-    print(f"🚀 Exportando {model_name} a ONNX con Ultralytics RT-DETR")
+    print(f" Exportando {model_name} a ONNX con Ultralytics RT-DETR")
     print("=" * 60)
 
     # Cargar modelo preentrenado

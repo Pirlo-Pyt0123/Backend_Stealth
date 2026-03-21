@@ -40,6 +40,8 @@ models/*.pth
 *.onnx
 *.pt
 *.pth
+guns-knives-coco/
+guns-knives-yolo/
 test_images/*.jpg
 test_images/*.png
 test_images/*.jpeg
