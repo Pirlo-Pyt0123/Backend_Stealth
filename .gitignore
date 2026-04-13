@@ -45,6 +45,16 @@ guns-knives-yolo/
 test_images/*.jpg
 test_images/*.png
 test_images/*.jpeg
+# Videos
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.wmv
+*.flv
+*.webm
+*.m4v
+test_videos/
 output/*.jpg
 output/*.png
 output/*.jpeg
