@@ -6,10 +6,20 @@ Niveles de riesgo:
   SAFE     → Situación sin riesgo aparente
   WARNING  → Situación que requiere precaución
   CRITICAL → Peligro inmediato, acción requerida
+
+Arquitectura de dos etapas:
+  1. RT-DETR (Transformer) detecta objetos en la imagen → bboxes + clases
+  2. GradientBoostingClassifier clasifica el escenario a partir del vector de
+     features extraído de esas detecciones → scenario_key + probabilidades
+
+Si el modelo ML no está disponible (models/traffic_clf.pkl ausente), el motor
+cae al análisis por reglas como fallback automático.
 """
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional
+import os
+import pickle
 import numpy as np
 
 
@@ -256,9 +266,25 @@ class TrafficRiskEngine:
     """
 
     # Umbral de distancia normalizada para considerar "cerca"
-    PROXIMITY_THRESHOLD = 0.18   # ~18% del ancho/alto de la imagen
-    # Factor de expansión del bbox de vehículo para zona de peligro
+    PROXIMITY_THRESHOLD = 0.18
     DANGER_ZONE_FACTOR  = 1.6
+    MODEL_PATH = os.path.join("models", "traffic_clf.pkl")
+
+    def __init__(self):
+        self._clf   = None
+        self._using_ml = False
+        if os.path.exists(self.MODEL_PATH):
+            try:
+                from engines.feature_extractor import extract_traffic_features
+                self._extract = extract_traffic_features
+                with open(self.MODEL_PATH, "rb") as f:
+                    self._clf = pickle.load(f)
+                self._using_ml = True
+                print(f"TrafficRiskEngine: modelo ML cargado ({self.MODEL_PATH})")
+            except Exception as e:
+                print(f"TrafficRiskEngine: no se pudo cargar ML — usando reglas. ({e})")
+        else:
+            print("TrafficRiskEngine: modelo ML no encontrado — usando reglas.")
 
     def analyze(
         self,
@@ -278,6 +304,44 @@ class TrafficRiskEngine:
           - detecciones_clave: lista de objetos involucrados
           - stats:           resumen de objetos detectados
         """
+        # ── Path ML (clasificador entrenado) ──────────────────────────────
+        if self._using_ml:
+            feats  = self._extract(detections, image_shape, image)
+            label  = self._clf.predict(feats.reshape(1, -1))[0]
+            probs  = self._clf.predict_proba(feats.reshape(1, -1))[0]
+            classes = self._clf.classes_
+            scenario_probs = {
+                str(cls): round(float(p), 4)
+                for cls, p in zip(classes, probs)
+            }
+            # Análisis de iluminación para stats (igual que en reglas)
+            lighting = analyze_lighting(image) if image is not None else None
+            persons  = [d for d in detections if d["class_id"] == CLASS_PERSON]
+            vehicles = [d for d in detections if d["class_id"] in VEHICLE_CLASSES]
+            bicycles = [d for d in detections if d["class_id"] == CLASS_BICYCLE]
+            stats = {
+                "personas":      len(persons),
+                "bicicletas":    len(bicycles),
+                "vehiculos":     len(vehicles),
+                "objetos_total": len(detections),
+                "iluminacion":   lighting,
+                "ml_mode":       True,
+                "scenario_probs": scenario_probs,
+            }
+            result = self._build_result(label, [], stats)
+            result["scenario_probs"] = scenario_probs
+            return result
+
+        # ── Fallback: análisis por reglas ─────────────────────────────────
+        return self._analyze_rules(detections, image_shape, image)
+
+    def _analyze_rules(
+        self,
+        detections: List[Dict[str, Any]],
+        image_shape,
+        image: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
+        """Lógica de reglas original — usada como fallback y para generar labels de entrenamiento."""
         img_h, img_w = image_shape[0], image_shape[1]
 
         # Separar por categoría

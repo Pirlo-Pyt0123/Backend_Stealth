@@ -8,9 +8,9 @@ import tempfile
 import os
 from typing import Dict
 
-from rtdetr_detector import RTDetrDetector, TRAFFIC_CLASS_IDS
-from traffic_risk_engine import TrafficRiskEngine
-from suspicious_behavior_engine import SuspiciousBehaviorEngine, SECURITY_CLASSES
+from engines.rtdetr_detector import RTDetrDetector, TRAFFIC_CLASS_IDS
+from engines.traffic_risk_engine import TrafficRiskEngine
+from engines.suspicious_behavior_engine import SuspiciousBehaviorEngine, SECURITY_CLASSES
 
 app = FastAPI(
     title="StealthVision — Security & Vial",

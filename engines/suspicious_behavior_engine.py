@@ -9,11 +9,21 @@ Niveles de alerta:
   SAFE     → Sin amenaza detectada
   WARNING  → Comportamiento sospechoso, vigilar
   CRITICAL → Amenaza inmediata, acción requerida
+
+Arquitectura de dos etapas:
+  1. RT-DETR detecta objetos → bboxes + clases
+  2. PersonTracker mantiene identidades entre frames (estado temporal)
+  3. GradientBoostingClassifier clasifica el escenario a partir del vector de
+     features (detecciones + estado del tracker) → scenario_key + probabilidades
+
+Si models/security_clf.pkl no existe, cae automáticamente al análisis por reglas.
 """
 
 from __future__ import annotations
 from typing import List, Dict, Any, Optional, Tuple
 from collections import defaultdict, deque
+import os
+import pickle
 import numpy as np
 import time
 
@@ -355,10 +365,26 @@ class SuspiciousBehaviorEngine:
     WEAPON_PROX_DIST    = 0.25   # Arma cercana a persona
     LARGE_GROUP_COUNT   = 4      # N personas para "grupo sospechoso"
 
+    MODEL_PATH = os.path.join("models", "security_clf.pkl")
+
     def __init__(self):
         self.tracker = PersonTracker()
         self._frame_count = 0
         self._session_start = time.time()
+        self._clf      = None
+        self._using_ml = False
+        if os.path.exists(self.MODEL_PATH):
+            try:
+                from engines.feature_extractor import extract_security_features
+                self._extract = extract_security_features
+                with open(self.MODEL_PATH, "rb") as f:
+                    self._clf = pickle.load(f)
+                self._using_ml = True
+                print(f"SuspiciousBehaviorEngine: modelo ML cargado ({self.MODEL_PATH})")
+            except Exception as e:
+                print(f"SuspiciousBehaviorEngine: no se pudo cargar ML — usando reglas. ({e})")
+        else:
+            print("SuspiciousBehaviorEngine: modelo ML no encontrado — usando reglas.")
 
     def reset(self):
         """Reinicia el estado temporal (nueva sesión de video)."""
@@ -394,15 +420,12 @@ class SuspiciousBehaviorEngine:
 
         img_h, img_w = image_shape[0], image_shape[1]
 
-        # Separar por clase
         persons  = [d for d in detections if d["class_id"] == CLASS_PERSON]
         weapons  = [d for d in detections if d["class_id"] in WEAPON_CLASSES]
         objects  = [d for d in detections if d["class_id"] in OBJECT_CLASSES]
-
-        # Análisis de iluminación
         lighting = analyze_lighting(image) if image is not None else None
 
-        # Actualizar tracker con personas del frame actual
+        # El tracker siempre corre — mantiene la identidad de personas entre frames
         active_tracks = self.tracker.update(persons, now, img_w, img_h)
 
         stats = {
@@ -414,7 +437,68 @@ class SuspiciousBehaviorEngine:
             "iluminacion":    lighting,
         }
 
-        # Evaluación de escenarios (orden: mayor → menor gravedad)
+        # ── Path ML ───────────────────────────────────────────────────────
+        if self._using_ml:
+            feats  = self._extract(detections, image_shape, image, active_tracks, now)
+            label  = self._clf.predict(feats.reshape(1, -1))[0]
+            probs  = self._clf.predict_proba(feats.reshape(1, -1))[0]
+            classes = self._clf.classes_
+            scenario_probs = {
+                str(cls): round(float(p), 4)
+                for cls, p in zip(classes, probs)
+            }
+            stats["ml_mode"]        = True
+            stats["scenario_probs"] = scenario_probs
+            result = self._build(label, [], stats, active_tracks)
+            result["scenario_probs"] = scenario_probs
+            return result
+
+        # ── Fallback: reglas ──────────────────────────────────────────────
+        loiterers          = [t for t in active_tracks.values() if t.is_loitering(now)]
+        loitering_count    = len(loiterers)
+        max_loiter_seconds = max((t.age_seconds for t in loiterers), default=0.0)
+        return self._analyze_rules(
+            detections, image_shape, image,
+            loitering_count=loitering_count,
+            max_loiter_seconds=max_loiter_seconds,
+            _active_tracks=active_tracks,
+            _stats=stats,
+        )
+
+    def _analyze_rules(
+        self,
+        detections: List[Dict[str, Any]],
+        image_shape,
+        image=None,
+        loitering_count: int = 0,
+        max_loiter_seconds: float = 0.0,
+        _active_tracks: Dict = None,
+        _stats: Dict = None,
+    ) -> Dict[str, Any]:
+        """
+        Lógica de reglas pura — usada como fallback en producción y como
+        'profesor' para generar etiquetas de entrenamiento ML.
+
+        Parámetros loitering_count y max_loiter_seconds permiten inyectar
+        el estado del tracker durante entrenamiento sin instanciar un tracker real.
+        """
+        img_h, img_w = image_shape[0], image_shape[1]
+        active_tracks = _active_tracks or {}
+
+        persons  = [d for d in detections if d["class_id"] == CLASS_PERSON]
+        weapons  = [d for d in detections if d["class_id"] in WEAPON_CLASSES]
+        objects  = [d for d in detections if d["class_id"] in OBJECT_CLASSES]
+        lighting = analyze_lighting(image) if image is not None else None
+
+        stats = _stats or {
+            "personas":       len(persons),
+            "armas_visibles": len(weapons),
+            "objetos":        len(objects),
+            "tracks_activos": 0,
+            "frame":          0,
+            "iluminacion":    lighting,
+        }
+
         scenario_key = "situacion_normal"
         involucrados = []
 
@@ -432,7 +516,6 @@ class SuspiciousBehaviorEngine:
         if len(persons) >= 4:
             for i, target in enumerate(persons):
                 others = [p for j, p in enumerate(persons) if j != i]
-                # Filtrar solo los que están cerca
                 nearby = [p for p in others
                           if _dist_norm(p["bbox"], target["bbox"], img_w, img_h)
                           < self.ENCIRCLE_DIST]
@@ -441,7 +524,7 @@ class SuspiciousBehaviorEngine:
                     involucrados = [target] + nearby[:4]
                     return self._build(scenario_key, involucrados, stats, active_tracks)
 
-        # 3. CRITICAL — Confrontación (2+ personas con overlap o contacto físico)
+        # 3. CRITICAL — Confrontación (2+ personas con overlap y contacto físico)
         if len(persons) >= 2:
             for i in range(len(persons)):
                 for j in range(i + 1, len(persons)):
@@ -452,29 +535,23 @@ class SuspiciousBehaviorEngine:
                             involucrados = [persons[i], persons[j]]
                             return self._build(scenario_key, involucrados, stats, active_tracks)
 
-        # 4. WARNING — Merodeo (persona estacionada demasiado tiempo)
-        loiterers = [t for t in active_tracks.values() if t.is_loitering(now)]
-        if loiterers:
-            # Encontrar la detección correspondiente al track merodeador
-            loiter_bboxes = [t.bbox for t in loiterers]
-            loiter_dets = [p for p in persons
-                           if any(_iou(p["bbox"], lb) > 0.3 for lb in loiter_bboxes)]
+        # 4. WARNING — Merodeo
+        if loitering_count > 0:
             scenario_key = "merodeo"
-            involucrados = loiter_dets[:2]
-            # Agregamos info de tiempo al stats
-            stats["merodeo_segundos"] = round(max(t.age_seconds for t in loiterers), 1)
+            involucrados = persons[:2]
+            stats["merodeo_segundos"] = round(max_loiter_seconds, 1)
 
         # 5. WARNING — Zona oscura con personas
         if scenario_key == "situacion_normal" and lighting and lighting["is_dark"] and persons:
             scenario_key = "zona_oscura_persona"
             involucrados = persons[:2]
 
-        # 6. WARNING — Grupo numeroso (posible coordinación)
+        # 6. WARNING — Grupo numeroso
         if scenario_key == "situacion_normal" and len(persons) >= self.LARGE_GROUP_COUNT:
             scenario_key = "grupo_sospechoso"
             involucrados = persons[:self.LARGE_GROUP_COUNT]
 
-        # 7. Arma visible aunque no haya personas cerca — sigue siendo crítico
+        # 7. Arma visible sin personas cerca — sigue siendo crítico
         if scenario_key == "situacion_normal" and weapons:
             scenario_key = "arma_detectada"
             involucrados = weapons
