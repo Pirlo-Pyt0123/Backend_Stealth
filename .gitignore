@@ -33,19 +33,40 @@ env/
 *.swo
 *~
 
-# Modelos y datos
+# Datasets — no subir al repo (son pesados, se descargan con datasets/download_roboflow.py)
+datasets/fight_detection/
+datasets/fight_detection_v2/
+datasets/jaad_annotations/
+datasets/pedestrian_detection/
+datasets/stanford_drone/
+datasets/vehicle_detection/
+guns-knives-coco/
+guns-knives-yolo/
+
+# Modelos entrenados — binarios pesados, no van al repo
 models/*.onnx
 models/*.pt
 models/*.pth
+models/*.pkl
 *.onnx
 *.pt
 *.pth
-guns-knives-coco/
-guns-knives-yolo/
+rf-detr-medium.pth
+rtdetr-l.onnx
+rtdetr-l.pt
+
+# Imágenes y videos de test
 test_images/*.jpg
-test_images/*.png
 test_images/*.jpeg
-# Videos
+test_images/*.png
+test_images/*.MP4
+test_videos/
+paso1.jpg
+paso2.jpg
+paso3.jpg
+paso4.jpg
+
+# Videos en cualquier lugar
 *.mp4
 *.avi
 *.mov
@@ -54,15 +75,20 @@ test_images/*.jpeg
 *.flv
 *.webm
 *.m4v
-test_videos/
-output/*.jpg
-output/*.png
-output/*.jpeg
+*.MP4
+
+# Outputs generados (gráficas de los notebooks)
+output/
+
+# Runs de entrenamiento (YOLOv8 / RF-DETR)
+runs/
 
 # OS
 .DS_Store
 Thumbs.db
 *.log
+*.tmp
 
-# FastAPI
+# FastAPI / pytest
 .pytest_cache/
+*.pyc
