@@ -129,7 +129,7 @@ class DeepTrafficEngine:
             transformer_result = self._transformer.predict(detections, img_w, img_h)
 
         # ── Estado RL ─────────────────────────────────────────────────────
-        rl_state  = self._build_rl_state(persons, vehicles, large_v, brightness, transformer_result)
+        rl_state  = self._build_rl_state(persons, vehicles, large_v, brightness, transformer_result, img_w, img_h)
         rl_result = self._run_rl(rl_state)
 
         # ── Nivel de riesgo final ─────────────────────────────────────────
@@ -175,12 +175,17 @@ class DeepTrafficEngine:
             },
         }
 
-    def _build_rl_state(self, persons, vehicles, large_v, brightness, transformer_result) -> np.ndarray:
+    def _build_rl_state(self, persons, vehicles, large_v, brightness, transformer_result, img_w=640, img_h=640) -> np.ndarray:
         s = np.zeros(STATE_DIM, dtype=np.float32)
         s[0]  = min(len(persons), 10) / 10.0
         s[1]  = min(len(vehicles), 10) / 10.0
+        s[2]  = 0.0   # no weapons in traffic mode
+        s[3]  = self._min_person_vehicle_dist_norm(persons, vehicles, img_w, img_h)  # key fix!
+        s[4]  = self._person_vehicle_overlap(persons, vehicles)
         s[11] = brightness / 255.0
         s[12] = float(brightness < 90)
+        s[13] = min(1.0, brightness / 180.0)   # daytime proxy
+        s[24] = float(len(persons) > 0 and brightness < 90)
         s[26] = float(len(large_v) > 0)
         s[27] = float(len(vehicles) >= 3)
         s[28] = float(len(persons) > 0 and len(vehicles) > 0)
@@ -191,9 +196,42 @@ class DeepTrafficEngine:
             s[21] = probs.get("WARNING",  0.0)
             s[22] = probs.get("CRITICAL", 0.0)
             s[23] = probs.get("CRITICAL", 0.0) + probs.get("WARNING", 0.0) * 0.5
+        else:
+            # No transformer → estimate from geometry
+            d = float(s[3])
+            if d >= 0.5:
+                s[20] = 0.8
+            elif d >= 0.15:
+                s[21] = 0.6; s[23] = 0.4
+            else:
+                s[22] = 0.7; s[23] = 0.8
 
-        s[24] = float(len(persons) > 0 and brightness < 90)
-        return s
+        return np.clip(s, 0.0, 1.0)
+
+    @staticmethod
+    def _min_person_vehicle_dist_norm(persons, vehicles, img_w, img_h) -> float:
+        if not persons or not vehicles:
+            return 1.0
+        min_d = 1.0
+        for p in persons:
+            px = (p["bbox"][0] + p["bbox"][2]) / 2 / img_w
+            py = (p["bbox"][1] + p["bbox"][3]) / 2 / img_h
+            for v in vehicles:
+                vx = (v["bbox"][0] + v["bbox"][2]) / 2 / img_w
+                vy = (v["bbox"][1] + v["bbox"][3]) / 2 / img_h
+                d  = ((px-vx)**2 + (py-vy)**2) ** 0.5
+                min_d = min(min_d, d)
+        return float(min(min_d, 1.0))
+
+    @staticmethod
+    def _person_vehicle_overlap(persons, vehicles) -> float:
+        for p in persons:
+            px1, py1, px2, py2 = p["bbox"]
+            for v in vehicles:
+                vx1, vy1, vx2, vy2 = v["bbox"]
+                if px1 < vx2 and px2 > vx1 and py1 < vy2 and py2 > vy1:
+                    return 1.0
+        return 0.0
 
     def _run_rl(self, state: np.ndarray) -> Optional[Dict]:
         if self._rl_agent is None:

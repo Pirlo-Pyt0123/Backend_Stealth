@@ -1,3 +1,17 @@
+"""
+LUCY — Servidor principal StealthVision
+Reemplaza los motores de reglas por IA real:
+  - DeepSecurityEngine  (BehaviorLSTM + PPO)
+  - DeepTrafficEngine   (SpatialRiskTransformer + PPO)
+
+Los endpoints mantienen la misma firma que antes
+para que el Blueprint de UE5 no necesite cambios.
+
+Uso:
+    cd c:/Users/LENOVO/Documents/Stealth
+    python main.py
+"""
+
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 import numpy as np
@@ -8,58 +22,49 @@ import tempfile
 import os
 from typing import Dict
 
-from engines.rtdetr_detector import RTDetrDetector, TRAFFIC_CLASS_IDS
-from engines.traffic_risk_engine import TrafficRiskEngine
-from engines.suspicious_behavior_engine import SuspiciousBehaviorEngine, SECURITY_CLASSES
+from engines.rtdetr_detector   import RTDetrDetector, TRAFFIC_CLASS_IDS
+from engines.deep_traffic_engine   import DeepTrafficEngine
+from engines.deep_security_engine  import DeepSecurityEngine
 
 app = FastAPI(
-    title="StealthVision — Security & Vial",
-    description="Detección de riesgo vial y comportamiento sospechoso en tiempo real",
-    version="3.0.0",
+    title="LUCY — StealthVision AI",
+    description="IA real: BehaviorLSTM + SpatialRiskTransformer + PPO Agent",
+    version="4.0.0",
 )
 
-# --- Detectores ---
-# Detector legacy (solo personas) — mantiene compatibilidad con UE anterior
-detector = RTDetrDetector(
-    model_path="rtdetr-l.onnx",
-    conf_threshold=0.5,
-    person_class_id=0,
-)
+# ── Detectores RT-DETR ────────────────────────────────────────────────────────
+SECURITY_CLASS_IDS = {0, 43, 76}   # person, knife, scissors
 
-# Detector de tráfico completo
 traffic_detector = RTDetrDetector(
-    model_path="rtdetr-l.onnx",
-    conf_threshold=0.4,
-    target_class_ids=TRAFFIC_CLASS_IDS,
+    model_path       = "rtdetr-l.onnx",
+    conf_threshold   = 0.4,
+    target_class_ids = TRAFFIC_CLASS_IDS,   # person, bike, car, moto, bus, truck, tl, stop
 )
 
-# Detector de seguridad — personas + armas + objetos sospechosos
 security_detector = RTDetrDetector(
-    model_path="rtdetr-l.onnx",
-    conf_threshold=0.4,
-    target_class_ids=SECURITY_CLASSES,
+    model_path       = "rtdetr-l.onnx",
+    conf_threshold   = 0.4,
+    target_class_ids = SECURITY_CLASS_IDS,
 )
 
-# Motor de riesgo educativo (tráfico)
-risk_engine = TrafficRiskEngine()
-
-# Motores de seguridad — uno por sesión de video para mantener estado temporal
-# session_id → SuspiciousBehaviorEngine
-_security_engines: Dict[str, SuspiciousBehaviorEngine] = {}
+# ── Motores de IA (cargan modelos .pth al iniciar) ────────────────────────────
+traffic_engine  = DeepTrafficEngine()
+_security_engines: Dict[str, DeepSecurityEngine] = {}   # session_id → engine
 
 
-# ---------------------------------------------------------------------------
-# Utilidades internas
-# ---------------------------------------------------------------------------
+def _get_security_engine(session_id: str) -> DeepSecurityEngine:
+    if session_id not in _security_engines:
+        _security_engines[session_id] = DeepSecurityEngine()
+    return _security_engines[session_id]
 
+
+# ── Utilidades ────────────────────────────────────────────────────────────────
 def _load_image(data: bytes) -> np.ndarray:
-    """Carga imagen desde bytes (JPEG/PNG/EXR). Lanza HTTPException si falla."""
     nparr = np.frombuffer(data, np.uint8)
     image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if image is None:
-        suffix = ".exr"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=".exr", delete=False) as tmp:
             tmp.write(data)
             tmp_path = tmp.name
         try:
@@ -80,379 +85,283 @@ def _load_image(data: bytes) -> np.ndarray:
     return image
 
 
-def _get_security_engine(session_id: str) -> SuspiciousBehaviorEngine:
-    """Devuelve (o crea) el motor de seguridad para la sesión indicada."""
-    if session_id not in _security_engines:
-        _security_engines[session_id] = SuspiciousBehaviorEngine()
-    return _security_engines[session_id]
-
-
-RISK_COLORS = {
-    "CRITICAL": (0, 0, 255),
-    "WARNING":  (0, 165, 255),
+RISK_COLORS_BGR = {
     "SAFE":     (0, 200, 0),
+    "WARNING":  (0, 165, 255),
+    "CRITICAL": (0, 0, 255),
 }
 
-RISK_LABELS_ES = {
-    "CRITICAL": "PELIGRO",
-    "WARNING":  "PRECAUCION",
+LEVEL_LABELS = {
     "SAFE":     "SEGURO",
+    "WARNING":  "PRECAUCION",
+    "CRITICAL": "PELIGRO",
 }
 
 
-def _draw_detections(image: np.ndarray, detections, risk_result: dict) -> np.ndarray:
-    """Dibuja bboxes y overlay de riesgo sobre la imagen."""
-    out = image.copy()
-    color = risk_result.get("color_alerta", (0, 200, 0))
-    h, w = out.shape[:2]
+def _draw_traffic(image: np.ndarray, detections, result: dict) -> np.ndarray:
+    out   = image.copy()
+    level = result["risk_level"]
+    color = RISK_COLORS_BGR.get(level, (0, 200, 0))
+    h, w  = out.shape[:2]
 
-    # Bboxes de cada detección
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
         cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
         label = f"{det['class_name']} {det['confidence']:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
-        cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-        cv2.putText(out, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
+        cv2.rectangle(out, (x1, y1-th-6), (x1+tw+4, y1), color, -1)
+        cv2.putText(out, label, (x1+2, y1-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
 
-    # Banner de riesgo en la parte superior
-    level = risk_result["risk_level"]
     banner_h = 60
     cv2.rectangle(out, (0, 0), (w, banner_h), color, -1)
-    nivel_txt = RISK_LABELS_ES.get(level, level)
-    titulo    = risk_result.get("titulo", "")
-    cv2.putText(out, f"[{nivel_txt}] {titulo}", (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-    consejo = risk_result.get("consejo_rapido", "")
-    cv2.putText(out, consejo, (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(out,
+                f"[{LEVEL_LABELS[level]}] {result.get('titulo','')}",
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA)
+    cv2.putText(out,
+                result.get("mensaje", ""),
+                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255,255,255), 1, cv2.LINE_AA)
 
-    # Indicador de iluminación (esquina superior derecha)
-    lighting = risk_result.get("stats", {}).get("iluminacion")
-    if lighting and lighting["is_dark"]:
-        nivel_luz = lighting["nivel_luz"]
-        brightness = lighting["brightness"]
-        luz_txt = f"LUZ BAJA ({nivel_luz}) {brightness:.0f}/255"
-        (tw, _), _ = cv2.getTextSize(luz_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(out, (w - tw - 12, 0), (w, 22), (20, 20, 100), -1)
-        cv2.putText(out, luz_txt, (w - tw - 8, 16),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 255), 1)
-
+    if result.get("is_dark"):
+        txt = f"LUZ BAJA  {result['brightness']:.0f}/255"
+        (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(out, (w-tw-12, 0), (w, 20), (20, 20, 100), -1)
+        cv2.putText(out, txt, (w-tw-8, 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 255), 1, cv2.LINE_AA)
     return out
-
-
-SECURITY_LEVEL_COLORS = {
-    "CRITICAL": (0, 0, 255),
-    "WARNING":  (0, 140, 255),
-    "SAFE":     (0, 200, 0),
-}
-
-SECURITY_LEVEL_LABELS = {
-    "CRITICAL": "ALERTA",
-    "WARNING":  "SOSPECHOSO",
-    "SAFE":     "NORMAL",
-}
 
 
 def _draw_security(image: np.ndarray, detections, result: dict) -> np.ndarray:
-    """Dibuja bboxes, tracks y banner de alerta de seguridad."""
     out   = image.copy()
-    color = result.get("color_alerta", (0, 200, 0))
-    h, w  = out.shape[:2]
     level = result["risk_level"]
+    color = RISK_COLORS_BGR.get(level, (0, 200, 0))
+    h, w  = out.shape[:2]
 
-    # Bboxes de detecciones crudas
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
-        cls = det["class_name"]
-        # Armas en rojo aunque el nivel sea bajo
-        det_color = (0, 0, 255) if cls in ("knife", "scissors") else color
+        det_color = (0, 0, 255) if det["class_name"] in ("knife", "scissors") else color
         cv2.rectangle(out, (x1, y1), (x2, y2), det_color, 2)
-        label = f"{cls} {det['confidence']:.2f}"
+        label = f"{det['class_name']} {det['confidence']:.2f}"
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(out, (x1, y1 - th - 6), (x1 + tw + 4, y1), det_color, -1)
-        cv2.putText(out, label, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.rectangle(out, (x1, y1-th-6), (x1+tw+4, y1), det_color, -1)
+        cv2.putText(out, label, (x1+2, y1-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
 
-    # IDs de tracks sobre personas
-    for track in result.get("tracks", []):
-        x1, y1, x2, y2 = track["bbox"]
-        tid  = track["track_id"]
-        age  = track["age_seconds"]
-        loit = track["loitering"]
-        t_color = (0, 0, 255) if loit else (200, 200, 0)
-        label = f"ID:{tid} {age:.0f}s" + (" [MERODEANDO]" if loit else "")
-        cv2.putText(out, label, (x1, y2 + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, t_color, 1)
-
-    # Banner superior
     banner_h = 65
     cv2.rectangle(out, (0, 0), (w, banner_h), color, -1)
-    nivel_txt = SECURITY_LEVEL_LABELS.get(level, level)
-    titulo    = result.get("titulo", "")
-    cv2.putText(out, f"[{nivel_txt}] {titulo}", (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
-    consejo = result.get("consejo", "")
-    cv2.putText(out, consejo, (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.47, (255, 255, 255), 1)
+    behavior = result.get("behavior", "normal")
+    cv2.putText(out,
+                f"[{LEVEL_LABELS[level]}] LUCY: {behavior.upper()}",
+                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 2, cv2.LINE_AA)
+    conf   = result.get("behavior_conf", 0.0)
+    buf    = result.get("buffer_ready", False)
+    status = "LSTM activo" if buf else f"Calentando {result.get('frame', 0)}/30 frames"
+    info   = f"Confianza: {conf*100:.0f}%  |  {status}"
+    cv2.putText(out, info, (10, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.47, (255,255,255), 1, cv2.LINE_AA)
 
-    # Indicador de iluminación
-    lighting = result.get("stats", {}).get("iluminacion")
-    if lighting and lighting["is_dark"]:
-        luz_txt = f"ZONA OSCURA ({lighting['nivel_luz']}) {lighting['brightness']:.0f}/255"
-        (tw, _), _ = cv2.getTextSize(luz_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        cv2.rectangle(out, (w - tw - 12, 0), (w, 20), (20, 20, 100), -1)
-        cv2.putText(out, luz_txt, (w - tw - 8, 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 255), 1)
+    if result.get("is_dark"):
+        txt = f"ZONA OSCURA  {result['brightness']:.0f}/255"
+        (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        cv2.rectangle(out, (w-tw-12, 0), (w, 20), (20, 20, 100), -1)
+        cv2.putText(out, txt, (w-tw-8, 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200,200,255), 1, cv2.LINE_AA)
 
-    # Contador de personas + tracks activos (esquina inferior derecha)
-    info = f"Personas: {result['stats']['personas']} | Tracks: {result['stats']['tracks_activos']}"
-    (tw, th), _ = cv2.getTextSize(info, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-    cv2.rectangle(out, (w - tw - 10, h - th - 14), (w, h), (40, 40, 40), -1)
-    cv2.putText(out, info, (w - tw - 6, h - 6),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
-
+    persons  = result.get("persons_found", 0)
+    weapons  = result.get("weapons_found", 0)
+    info_br  = f"Personas: {persons}  |  Armas: {weapons}  |  Frame: {result.get('frame',0)}"
+    (tw, th), _ = cv2.getTextSize(info_br, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+    cv2.rectangle(out, (w-tw-10, h-th-14), (w, h), (40,40,40), -1)
+    cv2.putText(out, info_br, (w-tw-6, h-6),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220,220,220), 1, cv2.LINE_AA)
     return out
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 def health():
     return {
-        "status":     "ok",
-        "version":    "3.0.0",
-        "model":      traffic_detector.model_path,
-        "providers":  traffic_detector.session.get_providers(),
-        "input_size": f"{traffic_detector.in_w}x{traffic_detector.in_h}",
-        "modes": {
+        "status":  "ok",
+        "version": "4.0.0 — LUCY AI",
+        "models": {
+            "traffic":  "SpatialRiskTransformer + PPO",
+            "security": "BehaviorLSTM + PPO",
+            "detector": "RT-DETR ONNX",
+        },
+        "endpoints": {
             "traffic":  "POST /analyze | /analyze_visual",
-            "security": "POST /security | /security_visual (con ?session_id=)",
+            "security": "POST /security | /security_visual",
         },
     }
 
 
-@app.post("/detect")
-async def detect(file: UploadFile = File(...)):
-    """
-    Endpoint legacy — detecta solo personas.
-    Mantiene compatibilidad con la integración de Unreal Engine anterior.
-    """
-    try:
-        data  = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="Archivo vacío")
-
-        image = _load_image(data)
-        t0    = time.time()
-        dets  = detector.detect(image)
-        dt    = (time.time() - t0) * 1000.0
-
-        return JSONResponse({
-            "detected":       len(dets) > 0,
-            "count":          len(dets),
-            "detections":     dets,
-            "inference_time_ms": round(dt, 2),
-            "image_shape":    {"height": image.shape[0], "width": image.shape[1]},
-            "content_type":   file.content_type,
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("Backend error /detect:", repr(e))
-        raise HTTPException(status_code=500, detail=str(e))
-
+# ── Tráfico ───────────────────────────────────────────────────────────────────
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
     """
-    Endpoint principal — detección vial + análisis de riesgo educativo.
-    Devuelve objetos detectados + nivel de peligro + mensaje pedagógico.
-    Diseñado para integración con Unreal Engine / simulador educativo.
+    Riesgo vial desde perspectiva peatón.
+    SpatialRiskTransformer + PPO Agent.
+    Mismo endpoint que antes — UE5 no necesita cambios.
     """
     try:
-        data  = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="Archivo vacío")
-
-        image = _load_image(data)
+        image = _load_image(await file.read())
         t0    = time.time()
         dets  = traffic_detector.detect(image)
-        risk  = risk_engine.analyze(dets, image.shape, image=image)
+        result = traffic_engine.analyze(dets, image.shape, image=image)
         dt    = (time.time() - t0) * 1000.0
 
         return JSONResponse({
-            "risk_level":      risk["risk_level"],
-            "scenario":        risk["scenario_key"],
-            "titulo":          risk["titulo"],
-            "explicacion":     risk["explicacion"],
-            "leccion":         risk["leccion"],
-            "consejo_rapido":  risk["consejo_rapido"],
-            "stats":           risk["stats"],
-            "detecciones_clave": risk["detecciones_clave"],
+            # Campos que UE5 ya conoce
+            "risk_level":      result["risk_level"],
+            "titulo":          result.get("titulo", ""),
+            "mensaje":         result.get("mensaje", ""),
+            "leccion":         result.get("leccion", ""),
+            "color_alerta":    result.get("color_alerta", [0,200,0]),
+            # Campos nuevos de LUCY IA
+            "lucy_action":     result.get("rl_action"),
+            "transformer_conf":result.get("transformer_conf", 0.0),
+            "attention":       result.get("attention", []),
+            "is_dark":         result.get("is_dark", False),
+            "brightness":      result.get("brightness", 128.0),
             "todas_detecciones": dets,
             "inference_time_ms": round(dt, 2),
-            "image_shape":    {"height": image.shape[0], "width": image.shape[1]},
+            "image_shape": {"height": image.shape[0], "width": image.shape[1]},
         })
-
     except HTTPException:
         raise
     except Exception as e:
-        print("Backend error /analyze:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/analyze_visual")
 async def analyze_visual(file: UploadFile = File(...)):
-    """
-    Igual que /analyze pero devuelve la imagen anotada con bboxes y banner de riesgo.
-    Útil para visualización directa en Unreal Engine o demos.
-    """
+    """Igual que /analyze pero retorna imagen anotada con bboxes y banner."""
     try:
-        data  = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="Archivo vacío")
-
-        image = _load_image(data)
-        dets  = traffic_detector.detect(image)
-        risk  = risk_engine.analyze(dets, image.shape, image=image)
-        out   = _draw_detections(image, dets, risk)
-
-        _, buffer = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/jpeg")
-
+        image  = _load_image(await file.read())
+        dets   = traffic_detector.detect(image)
+        result = traffic_engine.analyze(dets, image.shape, image=image)
+        out    = _draw_traffic(image, dets, result)
+        _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
     except HTTPException:
         raise
     except Exception as e:
-        print("Backend error /analyze_visual:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Endpoints de SEGURIDAD (detección de comportamiento sospechoso en tiempo real)
-# ---------------------------------------------------------------------------
+# ── Seguridad ─────────────────────────────────────────────────────────────────
 
 @app.post("/security")
 async def security_analyze(
-    file: UploadFile = File(...),
-    session_id: str = Query(default="default", description="ID de sesión de video. "
-                            "Usar el mismo ID entre frames para mantener tracking temporal."),
-    timestamp: float = Query(default=None, description="Timestamp UNIX del frame. "
-                             "Si se omite, usa el tiempo del servidor."),
+    file:       UploadFile = File(...),
+    session_id: str        = Query(default="default"),
+    timestamp:  float      = Query(default=None),
 ):
     """
-    Endpoint principal de seguridad — análisis en tiempo real.
-
-    Enviar frames consecutivos con el mismo `session_id` para activar:
-    - Tracking de personas entre frames (quién es quién)
-    - Detección de merodeo (persona quieta >5 segundos)
-    - Detección de encercamiento, confrontación, armas
-
-    Diseñado para integración con Unreal Engine en tiempo real.
+    Seguridad ciudadana en tiempo real.
+    BehaviorLSTM (30 frames) + PPO Agent.
+    Enviar frames consecutivos con el mismo session_id.
     """
     try:
-        data = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="Archivo vacío")
-
-        image  = _load_image(data)
+        image  = _load_image(await file.read())
         ts     = timestamp if timestamp is not None else time.time()
         t0     = time.time()
         dets   = security_detector.detect(image)
         engine = _get_security_engine(session_id)
-        result = engine.analyze(dets, image.shape, image=image, timestamp=ts,
-                                session_id=session_id)
-        dt = (time.time() - t0) * 1000.0
+        result = engine.analyze(dets, image.shape, image=image, timestamp=ts)
+        dt     = (time.time() - t0) * 1000.0
 
         return JSONResponse({
+            # Campos que UE5 ya conoce
             "risk_level":    result["risk_level"],
-            "scenario_key":  result["scenario_key"],
-            "titulo":        result["titulo"],
-            "descripcion":   result["descripcion"],
-            "accion":        result["accion"],
-            "consejo":       result["consejo"],
-            "involucrados":  result["involucrados"],
-            "tracks":        result["tracks"],
-            "stats":         result["stats"],
-            "todas_detecciones": dets,
+            "color_alerta":  list(result["color_alerta"]),
+            # Campos nuevos de LUCY IA
+            "behavior":      result["behavior"],
+            "behavior_conf": round(result["behavior_conf"], 3),
+            "all_behaviors": result["all_behaviors"],
+            "rl_action":     result["rl_action"],
+            "weapons_found": result["weapons_found"],
+            "persons_found": result["persons_found"],
+            "brightness":    result["brightness"],
+            "is_dark":       result["is_dark"],
+            "buffer_ready":  result["buffer_ready"],
+            "frame":         result["frame"],
             "session_id":    session_id,
+            "todas_detecciones": dets,
             "inference_time_ms": round(dt, 2),
             "image_shape":   {"height": image.shape[0], "width": image.shape[1]},
         })
-
     except HTTPException:
         raise
     except Exception as e:
-        print("Backend error /security:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/security_visual")
 async def security_visual(
-    file: UploadFile = File(...),
-    session_id: str = Query(default="default"),
-    timestamp: float = Query(default=None),
+    file:       UploadFile = File(...),
+    session_id: str        = Query(default="default"),
+    timestamp:  float      = Query(default=None),
 ):
-    """
-    Igual que /security pero devuelve la imagen anotada con bboxes,
-    track IDs, indicadores de merodeo y banner de alerta.
-    Útil para visualización directa en Unreal Engine / monitor de seguridad.
-    """
+    """Igual que /security pero retorna imagen anotada."""
     try:
-        data = await file.read()
-        if not data:
-            raise HTTPException(status_code=400, detail="Archivo vacío")
-
-        image  = _load_image(data)
+        image  = _load_image(await file.read())
         ts     = timestamp if timestamp is not None else time.time()
         dets   = security_detector.detect(image)
         engine = _get_security_engine(session_id)
-        result = engine.analyze(dets, image.shape, image=image, timestamp=ts,
-                                session_id=session_id)
+        result = engine.analyze(dets, image.shape, image=image, timestamp=ts)
         out    = _draw_security(image, dets, result)
-
-        _, buffer = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        return StreamingResponse(io.BytesIO(buffer.tobytes()), media_type="image/jpeg")
-
+        _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
     except HTTPException:
         raise
     except Exception as e:
-        print("Backend error /security_visual:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/security/reset")
-async def security_reset(
-    session_id: str = Query(default="default"),
-):
-    """
-    Reinicia el estado temporal del motor de seguridad para una sesión.
-    Llamar al inicio de cada nueva grabación o escena en Unreal Engine.
-    """
+async def security_reset(session_id: str = Query(default="default")):
+    """Reinicia el buffer temporal de LUCY para una sesión (nueva escena en UE5)."""
     if session_id in _security_engines:
         _security_engines[session_id].reset()
-    return {"status": "ok", "session_id": session_id, "message": "Estado reiniciado"}
+    return {"status": "ok", "session_id": session_id}
 
 
 @app.get("/security/sessions")
 async def security_sessions():
-    """Lista las sesiones de seguridad activas y su estado."""
-    sessions = {}
-    for sid, engine in _security_engines.items():
-        tracks = engine.tracker._tracks
-        sessions[sid] = {
-            "frames_procesados": engine._frame_count,
-            "tracks_activos":    len(tracks),
-            "track_ids":         list(tracks.keys()),
+    """Lista sesiones activas y su estado."""
+    return {
+        sid: {
+            "frames_procesados": eng._frame_count,
+            "buffer_ready":      len(eng._seq_buffer) >= 30,
+            "buffer_frames":     len(eng._seq_buffer),
         }
-    return sessions
+        for sid, eng in _security_engines.items()
+    }
 
 
-# ---------------------------------------------------------------------------
+# ── Legacy — mantiene compatibilidad con Blueprint antiguo ────────────────────
+@app.post("/detect")
+async def detect_legacy(file: UploadFile = File(...)):
+    """Endpoint legacy — solo personas. Mantiene compatibilidad con UE5 anterior."""
+    try:
+        image = _load_image(await file.read())
+        dets  = security_detector.detect(image)
+        persons = [d for d in dets if d["class_id"] == 0]
+        return JSONResponse({
+            "detected":   len(persons) > 0,
+            "count":      len(persons),
+            "detections": persons,
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
