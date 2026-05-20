@@ -1,38 +1,49 @@
 """
-DeepTrafficEngine — Motor de riesgo vial de LUCY (perspectiva peatón).
+DeepTrafficEngine -- LUCY road risk engine (pedestrian perspective).
 
-Reemplaza el motor basado en reglas anterior.
-Usa el SpatialRiskTransformer: un Transformer que aprendió
-qué configuraciones espaciales son peligrosas para un peatón.
+TrafficRiskNet = SpatialRiskTransformer + BiGRU.
+Trained on JAAD real pedestrian trajectories + synthetic data.
 
-Sin distancias hardcodeadas. Sin umbrales geométricos fijos.
-La red aprendió sola de miles de escenarios.
+Architecture defined inline -- no external model file dependencies.
+Session-aware: each session_id maintains its own GRU frame buffer.
+
+Usage:
+    engine = DeepTrafficEngine()
+    result = engine.analyze(detections, image_shape, image=frame, session_id="ue5")
 """
 
 from __future__ import annotations
 import os
+import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from collections import deque
 from typing import List, Dict, Any, Optional
-
-from models.spatial_risk_net import (
-    SpatialRiskTransformer, RISK_CLASSES, detections_to_tokens
-)
-from models.rl_environment import ActorCritic, STATE_DIM, ACTIONS
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# COCO IDs
-CLASS_PERSON    = 0
-CLASS_BICYCLE   = 1
-CLASS_CAR       = 2
-CLASS_MOTORCYCLE= 3
-CLASS_BUS       = 5
-CLASS_TRUCK     = 7
-CLASS_TL        = 9
-CLASS_STOP      = 11
-VEHICLE_CLASSES = {CLASS_CAR, CLASS_MOTORCYCLE, CLASS_BUS, CLASS_TRUCK}
-LARGE_VEHICLES  = {CLASS_BUS, CLASS_TRUCK}
+# ── Architecture constants ─────────────────────────────────────────────────────
+N_COCO_CLASSES = 80
+D_MODEL        = 64
+MAX_OBJECTS    = 20
+SEQ_LEN        = 15
+GRU_HIDDEN     = 128
+GRU_LAYERS     = 2
+N_RISK         = 3
+RISK_CLASSES   = ["SAFE", "WARNING", "CRITICAL"]
+
+# ── COCO IDs ──────────────────────────────────────────────────────────────────
+CLASS_PERSON     = 0
+CLASS_BICYCLE    = 1
+CLASS_CAR        = 2
+CLASS_MOTORCYCLE = 3
+CLASS_BUS        = 5
+CLASS_TRUCK      = 7
+CLASS_TL         = 9
+VEHICLE_CLASSES  = {CLASS_CAR, CLASS_MOTORCYCLE, CLASS_BUS, CLASS_TRUCK}
+LARGE_VEHICLES   = {CLASS_BUS, CLASS_TRUCK}
 
 RISK_COLORS = {
     "SAFE":     (0, 200, 0),
@@ -40,216 +51,350 @@ RISK_COLORS = {
     "CRITICAL": (0, 0, 255),
 }
 
-# Mensajes educativos (perspectiva peatón) — LUCY los explica
+TL_COLORS_BGR = {
+    "RED":     (0,   0,   255),
+    "YELLOW":  (0,   215, 255),
+    "GREEN":   (0,   200, 0),
+    "UNKNOWN": (128, 128, 128),
+}
+
 PEDESTRIAN_MESSAGES = {
     "SAFE": {
-        "titulo":  "Situación segura",
-        "mensaje": "No se detectaron riesgos para peatones en esta escena.",
-        "leccion": "¡Bien! Pero siempre mira a ambos lados antes de cruzar.",
+        "titulo":  "Situacion segura",
+        "mensaje": "No se detectaron riesgos para peatones.",
+        "leccion": "Siempre mira a ambos lados antes de cruzar.",
     },
     "WARNING": {
-        "titulo":  "Precaución para peatones",
-        "mensaje": "Hay una situación que requiere atención. Reduce velocidad y observa.",
-        "leccion": "Usa el paso de cebra. Espera a que los vehículos se detengan completamente.",
+        "titulo":  "Precaucion",
+        "mensaje": "Situacion que requiere atencion. Observa antes de avanzar.",
+        "leccion": "Usa el paso de cebra. Espera a que los vehiculos se detengan.",
     },
     "CRITICAL": {
-        "titulo":  "¡PELIGRO para peatón!",
+        "titulo":  "PELIGRO",
         "mensaje": "LUCY detecta riesgo inmediato. Detente y espera.",
-        "leccion": "NUNCA cruces sin verificar. Un segundo de atención puede salvar tu vida.",
+        "leccion": "NUNCA cruces sin verificar. Un segundo puede salvar tu vida.",
     },
 }
 
 
-class DeepTrafficEngine:
-    """
-    Motor de riesgo vial con IA genuina para LUCY (perspectiva peatón).
+# ── Neural network architecture ────────────────────────────────────────────────
+class _ObjectTokenEmbedding(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.class_emb = nn.Embedding(N_COCO_CLASSES + 1, 16, padding_idx=N_COCO_CLASSES)
+        self.geo_proj  = nn.Linear(5, 32)
+        self.out_proj  = nn.Linear(48, D_MODEL)
+        self.norm      = nn.LayerNorm(D_MODEL)
 
-    Usa SpatialRiskTransformer para aprender relaciones espaciales
-    entre peatones y vehículos sin reglas hardcodeadas.
+    def forward(self, tokens):
+        cls_ids  = tokens[..., 0].long().clamp(0, N_COCO_CLASSES)
+        geo      = tokens[..., 1:]
+        cls_feat = self.class_emb(cls_ids)
+        geo_feat = F.relu(self.geo_proj(geo))
+        return self.norm(self.out_proj(torch.cat([cls_feat, geo_feat], -1)))
 
-    Uso:
-        engine = DeepTrafficEngine()
-        result = engine.analyze(detections, image_shape=(h,w), image=frame)
-    """
 
-    MODELS_DIR = "models"
+class _SpatialRiskTransformer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_emb = _ObjectTokenEmbedding()
+        self.cls_token = nn.Parameter(torch.randn(1, 1, D_MODEL) * 0.02)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=D_MODEL, nhead=4, dim_feedforward=256,
+            dropout=0.1, batch_first=True, norm_first=True)
+        self.encoder    = nn.TransformerEncoder(enc_layer, num_layers=3)
+        self.classifier = nn.Sequential(
+            nn.Linear(D_MODEL, 128), nn.ReLU(), nn.Dropout(0.2),
+            nn.Linear(128, 64),     nn.ReLU(), nn.Linear(64, N_RISK))
+
+    def forward(self, tokens, padding_mask=None, return_features=False):
+        B   = tokens.shape[0]
+        x   = self.token_emb(tokens)
+        cls = self.cls_token.expand(B, -1, -1)
+        x   = torch.cat([cls, x], dim=1)
+        if padding_mask is not None:
+            cls_mask     = torch.zeros(B, 1, dtype=torch.bool, device=x.device)
+            padding_mask = torch.cat([cls_mask, padding_mask], dim=1)
+        enc = self.encoder(x, src_key_padding_mask=padding_mask)
+        cls_out = enc[:, 0, :]
+        if return_features:
+            return cls_out
+        logits = self.classifier(cls_out)
+        return {"logits": logits, "probs": F.softmax(logits, -1)}
+
+
+class _GRUTemporalEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gru = nn.GRU(
+            input_size=D_MODEL, hidden_size=GRU_HIDDEN,
+            num_layers=GRU_LAYERS, batch_first=True,
+            dropout=0.3, bidirectional=True)
+        self.classifier = nn.Sequential(
+            nn.Linear(GRU_HIDDEN * 2, 128), nn.ReLU(), nn.Dropout(0.3),
+            nn.Linear(128, 64),             nn.ReLU(), nn.Linear(64, N_RISK))
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        logits = self.classifier(out[:, -1, :])
+        return {"logits": logits, "probs": F.softmax(logits, -1)}
+
+
+class _TrafficRiskNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.spatial  = _SpatialRiskTransformer()
+        self.temporal = _GRUTemporalEncoder()
+
+    def forward(self, tokens_seq, masks_seq):
+        B, T, N, F = tokens_seq.shape
+        feats = self.spatial(
+            tokens_seq.view(B * T, N, F),
+            masks_seq.view(B * T, N),
+            return_features=True,
+        )
+        return self.temporal(feats.view(B, T, D_MODEL))
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def _detections_to_tokens(detections, img_w, img_h):
+    rows = []
+    for det in detections[:MAX_OBJECTS]:
+        b  = det["bbox"]
+        cx = (b[0] + b[2]) / 2 / img_w
+        cy = (b[1] + b[3]) / 2 / img_h
+        w  = (b[2] - b[0]) / img_w
+        h  = (b[3] - b[1]) / img_h
+        rows.append([float(det["class_id"]), cx, cy, w, h, float(det["confidence"])])
+    n    = len(rows)
+    rows += [[float(N_COCO_CLASSES), 0, 0, 0, 0, 0]] * (MAX_OBJECTS - n)
+    return (
+        torch.tensor(rows, dtype=torch.float32),
+        torch.tensor([False] * n + [True] * (MAX_OBJECTS - n), dtype=torch.bool),
+    )
+
+
+def _detect_tl_state(image: np.ndarray, bbox) -> str:
+    """HSV crop analysis: returns 'RED', 'YELLOW', 'GREEN', or 'UNKNOWN'."""
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(image.shape[1] - 1, x2); y2 = min(image.shape[0] - 1, y2)
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0 or crop.shape[0] < 6 or crop.shape[1] < 3:
+        return "UNKNOWN"
+    hsv   = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    third = max(1, crop.shape[0] // 3)
+    top, mid, bot = hsv[:third], hsv[third:2*third], hsv[2*third:]
+
+    def _red(h):
+        return int(cv2.countNonZero(cv2.inRange(h, (0, 100, 100),   (10, 255, 255))) +
+                   cv2.countNonZero(cv2.inRange(h, (160, 100, 100), (180, 255, 255))))
+    def _yellow(h):
+        return int(cv2.countNonZero(cv2.inRange(h, (18, 100, 100), (35, 255, 255))))
+    def _green(h):
+        return int(cv2.countNonZero(cv2.inRange(h, (40, 80, 80),   (90, 255, 255))))
+
+    scores = {"RED": _red(top), "YELLOW": _yellow(mid), "GREEN": _green(bot)}
+    best   = max(scores, key=scores.get)
+    return best if scores[best] >= 5 else "UNKNOWN"
+
+
+# ── Sequence buffer ────────────────────────────────────────────────────────────
+class _SequenceBuffer:
+    """Sliding window of SEQ_LEN detection frames for the GRU."""
 
     def __init__(self):
-        self._transformer: Optional[SpatialRiskTransformer] = None
-        self._rl_agent:    Optional[ActorCritic]            = None
-        self._load_models()
+        self.buffer = deque(maxlen=SEQ_LEN)
 
-    def _load_models(self):
-        t_path  = os.path.join(self.MODELS_DIR, "spatial_risk_best.pth")
-        rl_path = os.path.join(self.MODELS_DIR, "rl_agent_best.pth")
+    @property
+    def ready(self) -> bool:
+        return len(self.buffer) == SEQ_LEN
 
-        if os.path.exists(t_path):
-            self._transformer = SpatialRiskTransformer().to(DEVICE)
-            self._transformer.load_state_dict(
-                torch.load(t_path, map_location=DEVICE, weights_only=True)
+    @property
+    def size(self) -> int:
+        return len(self.buffer)
+
+    def push(self, detections, img_w, img_h):
+        tokens, mask = _detections_to_tokens(detections, img_w, img_h)
+        self.buffer.append((tokens, mask))
+
+    def predict_full(self, model: _TrafficRiskNet) -> dict:
+        """GRU prediction over the full SEQ_LEN window."""
+        tokens_seq = torch.stack([b[0] for b in self.buffer]).unsqueeze(0).to(DEVICE)
+        masks_seq  = torch.stack([b[1] for b in self.buffer]).unsqueeze(0).to(DEVICE)
+        with torch.no_grad():
+            out = model(tokens_seq, masks_seq)
+        idx = out["probs"].argmax(-1).item()
+        return {
+            "risk_level": RISK_CLASSES[idx],
+            "confidence": float(out["probs"][0, idx]),
+            "all_probs":  {RISK_CLASSES[i]: round(float(out["probs"][0, i]), 3) for i in range(N_RISK)},
+        }
+
+    def predict_spatial(self, model: _TrafficRiskNet) -> dict:
+        """Transformer-only prediction on the last frame (warming-up fallback)."""
+        tok, mask = self.buffer[-1]
+        with torch.no_grad():
+            out = model.spatial(
+                tok.unsqueeze(0).to(DEVICE),
+                mask.unsqueeze(0).to(DEVICE),
             )
-            self._transformer.eval()
-            print(f"[LUCY Traffic] SpatialRiskTransformer cargado")
-        else:
-            print(f"[LUCY Traffic] SpatialRiskTransformer no encontrado — modo básico")
+        idx = out["probs"].argmax(-1).item()
+        return {
+            "risk_level": RISK_CLASSES[idx],
+            "confidence": float(out["probs"][0, idx]),
+            "all_probs":  {RISK_CLASSES[i]: round(float(out["probs"][0, i]), 3) for i in range(N_RISK)},
+        }
 
-        if os.path.exists(rl_path):
-            self._rl_agent = ActorCritic(STATE_DIM).to(DEVICE)
-            self._rl_agent.load_state_dict(
-                torch.load(rl_path, map_location=DEVICE, weights_only=True)
-            )
-            self._rl_agent.eval()
-            print(f"[LUCY Traffic] PPO Agent cargado")
+    def reset(self):
+        self.buffer.clear()
 
+
+# ── Public engine ──────────────────────────────────────────────────────────────
+class DeepTrafficEngine:
+    """
+    Road risk engine for LUCY — pedestrian perspective.
+
+    Model priority:
+        1. models/traffic_risk_jaad.pth  (JAAD + synthetic, Notebook 3)
+        2. models/traffic_risk_best.pth  (synthetic only, Notebook 1)
+        3. Basic heuristic fallback (no weights found)
+    """
+
+    MODELS_DIR       = "models"
+    MODEL_CANDIDATES = ["traffic_risk_jaad.pth", "traffic_risk_best.pth"]
+
+    def __init__(self):
+        self._model:    Optional[_TrafficRiskNet]        = None
+        self._buffers:  Dict[str, _SequenceBuffer]       = {}
+        self._model_name = "none"
+        self._load_model()
+
+    # ── Setup ──────────────────────────────────────────────────────────────────
+    def _load_model(self):
+        for fname in self.MODEL_CANDIDATES:
+            path = os.path.join(self.MODELS_DIR, fname)
+            if os.path.exists(path):
+                self._model = _TrafficRiskNet().to(DEVICE)
+                self._model.load_state_dict(
+                    torch.load(path, map_location=DEVICE, weights_only=True)
+                )
+                self._model.eval()
+                self._model_name = fname
+                print(f"[LUCY Traffic] TrafficRiskNet loaded: {fname}  device={DEVICE}")
+                return
+        print("[LUCY Traffic] No weights found -- heuristic fallback active")
+
+    def _get_buffer(self, session_id: str) -> _SequenceBuffer:
+        if session_id not in self._buffers:
+            self._buffers[session_id] = _SequenceBuffer()
+        return self._buffers[session_id]
+
+    def reset(self, session_id: str = "default"):
+        if session_id in self._buffers:
+            self._buffers[session_id].reset()
+
+    def session_info(self, session_id: str) -> dict:
+        buf = self._get_buffer(session_id)
+        return {"frames": buf.size, "ready": buf.ready, "seq_len": SEQ_LEN}
+
+    # ── Main entry point ───────────────────────────────────────────────────────
     def analyze(
         self,
         detections:  List[Dict[str, Any]],
         image_shape,
         image:       Optional[np.ndarray] = None,
+        session_id:  str = "default",
     ) -> Dict[str, Any]:
         """
-        Evalúa el riesgo vial para peatones en la escena.
+        Evaluate pedestrian road risk for a single frame.
 
-        detections  : lista de dicts (class_id, bbox, confidence, class_name)
-        image_shape : (H, W, ...)
-        image       : array numpy BGR opcional (para análisis de iluminación)
+        detections : list of dicts with keys: class_id, bbox, confidence, class_name
+        image_shape: (H, W, ...)
+        image      : optional BGR numpy array (enables TL HSV detection)
+        session_id : identifies the GRU frame buffer (one per UE5 session)
         """
         img_h, img_w = image_shape[0], image_shape[1]
+        brightness   = _get_brightness(image)
+
+        # ── Enrich TL detections with HSV state ────────────────────────────
+        if image is not None:
+            for det in detections:
+                if det["class_id"] == CLASS_TL:
+                    det["tl_state"] = _detect_tl_state(image, det["bbox"])
 
         persons  = [d for d in detections if d["class_id"] == CLASS_PERSON]
         bicycles = [d for d in detections if d["class_id"] == CLASS_BICYCLE]
         vehicles = [d for d in detections if d["class_id"] in VEHICLE_CLASSES]
         large_v  = [d for d in detections if d["class_id"] in LARGE_VEHICLES]
+        tl_dets  = [d for d in detections if d["class_id"] == CLASS_TL]
 
-        brightness = self._get_brightness(image)
+        # ── Model inference ────────────────────────────────────────────────
+        buf = self._get_buffer(session_id)
 
-        # ── SpatialRiskTransformer ─────────────────────────────────────────
-        transformer_result = None
-        if self._transformer is not None and detections:
-            transformer_result = self._transformer.predict(detections, img_w, img_h)
-
-        # ── Estado RL ─────────────────────────────────────────────────────
-        rl_state  = self._build_rl_state(persons, vehicles, large_v, brightness, transformer_result, img_w, img_h)
-        rl_result = self._run_rl(rl_state)
-
-        # ── Nivel de riesgo final ─────────────────────────────────────────
-        if transformer_result:
-            risk_level = transformer_result["risk_level"]
-            confidence = transformer_result["confidence"]
-            all_probs  = transformer_result["all_probs"]
-            attention  = transformer_result.get("attention", [])
-        else:
-            # Sin modelo: estimación básica por presencia de objetos
-            if persons and vehicles:
-                risk_level, confidence = "WARNING", 0.6
+        if self._model is not None and detections:
+            buf.push(detections, img_w, img_h)
+            if buf.ready:
+                result = buf.predict_full(self._model)
             else:
-                risk_level, confidence = "SAFE", 0.9
-            all_probs, attention = {}, []
+                result = buf.predict_spatial(self._model)
+        elif self._model is not None:
+            # No detections this frame — still push empty frame to keep buffer moving
+            buf.push([], img_w, img_h)
+            result = {"risk_level": "SAFE", "confidence": 0.95,
+                      "all_probs": {"SAFE": 0.95, "WARNING": 0.04, "CRITICAL": 0.01}}
+        else:
+            # Heuristic fallback (no weights)
+            if persons and vehicles:
+                result = {"risk_level": "WARNING", "confidence": 0.60,
+                          "all_probs": {"SAFE": 0.20, "WARNING": 0.60, "CRITICAL": 0.20}}
+            else:
+                result = {"risk_level": "SAFE", "confidence": 0.90,
+                          "all_probs": {"SAFE": 0.90, "WARNING": 0.08, "CRITICAL": 0.02}}
 
-        # RL puede elevar el nivel si su política lo indica
-        if rl_result and rl_result["action"] != risk_level:
-            rl_levels = {"SAFE": 0, "WARNING": 1, "CRITICAL": 2}
-            if rl_levels.get(rl_result["action"], 0) > rl_levels.get(risk_level, 0):
-                risk_level = rl_result["action"]
+        risk_level = result["risk_level"]
+        confidence = result["confidence"]
+        all_probs  = result["all_probs"]
+
+        # ── TL context override ────────────────────────────────────────────
+        tl_override = False
+        has_red_tl  = any(d.get("tl_state") == "RED" for d in tl_dets)
+        if has_red_tl and persons and risk_level == "SAFE":
+            risk_level  = "WARNING"
+            tl_override = True
 
         msg = PEDESTRIAN_MESSAGES[risk_level]
 
         return {
-            "risk_level":   risk_level,
-            "confidence":   round(confidence, 4),
-            "all_probs":    all_probs,
-            "attention":    attention,          # qué objetos activaron la alerta
-            "titulo":       msg["titulo"],
-            "mensaje":      msg["mensaje"],
-            "leccion":      msg["leccion"],
-            "color_alerta": RISK_COLORS[risk_level],
-            "rl_action":    rl_result.get("action") if rl_result else None,
+            # Core output (UE5-compatible keys)
+            "risk_level":    risk_level,
+            "confidence":    round(confidence, 4),
+            "all_probs":     all_probs,
+            "titulo":        msg["titulo"],
+            "mensaje":       msg["mensaje"],
+            "leccion":       msg["leccion"],
+            "color_alerta":  list(RISK_COLORS[risk_level]),
+            # Extended info
+            "tl_override":   tl_override,
+            "tl_states":     [d.get("tl_state", "UNKNOWN") for d in tl_dets],
+            "model_name":    self._model_name,
+            "buffer_ready":  buf.ready,
+            "frames_in":     buf.size,
+            "seq_len":       SEQ_LEN,
             "stats": {
                 "personas":   len(persons),
                 "bicicletas": len(bicycles),
                 "vehiculos":  len(vehicles),
                 "grandes":    len(large_v),
+                "semaforos":  len(tl_dets),
                 "brightness": round(brightness, 1),
                 "is_dark":    brightness < 90,
                 "total_dets": len(detections),
             },
         }
 
-    def _build_rl_state(self, persons, vehicles, large_v, brightness, transformer_result, img_w=640, img_h=640) -> np.ndarray:
-        s = np.zeros(STATE_DIM, dtype=np.float32)
-        s[0]  = min(len(persons), 10) / 10.0
-        s[1]  = min(len(vehicles), 10) / 10.0
-        s[2]  = 0.0   # no weapons in traffic mode
-        s[3]  = self._min_person_vehicle_dist_norm(persons, vehicles, img_w, img_h)  # key fix!
-        s[4]  = self._person_vehicle_overlap(persons, vehicles)
-        s[11] = brightness / 255.0
-        s[12] = float(brightness < 90)
-        s[13] = min(1.0, brightness / 180.0)   # daytime proxy
-        s[24] = float(len(persons) > 0 and brightness < 90)
-        s[26] = float(len(large_v) > 0)
-        s[27] = float(len(vehicles) >= 3)
-        s[28] = float(len(persons) > 0 and len(vehicles) > 0)
 
-        if transformer_result:
-            probs = transformer_result.get("all_probs", {})
-            s[20] = probs.get("SAFE",     0.0)
-            s[21] = probs.get("WARNING",  0.0)
-            s[22] = probs.get("CRITICAL", 0.0)
-            s[23] = probs.get("CRITICAL", 0.0) + probs.get("WARNING", 0.0) * 0.5
-        else:
-            # No transformer → estimate from geometry
-            d = float(s[3])
-            if d >= 0.5:
-                s[20] = 0.8
-            elif d >= 0.15:
-                s[21] = 0.6; s[23] = 0.4
-            else:
-                s[22] = 0.7; s[23] = 0.8
-
-        return np.clip(s, 0.0, 1.0)
-
-    @staticmethod
-    def _min_person_vehicle_dist_norm(persons, vehicles, img_w, img_h) -> float:
-        if not persons or not vehicles:
-            return 1.0
-        min_d = 1.0
-        for p in persons:
-            px = (p["bbox"][0] + p["bbox"][2]) / 2 / img_w
-            py = (p["bbox"][1] + p["bbox"][3]) / 2 / img_h
-            for v in vehicles:
-                vx = (v["bbox"][0] + v["bbox"][2]) / 2 / img_w
-                vy = (v["bbox"][1] + v["bbox"][3]) / 2 / img_h
-                d  = ((px-vx)**2 + (py-vy)**2) ** 0.5
-                min_d = min(min_d, d)
-        return float(min(min_d, 1.0))
-
-    @staticmethod
-    def _person_vehicle_overlap(persons, vehicles) -> float:
-        for p in persons:
-            px1, py1, px2, py2 = p["bbox"]
-            for v in vehicles:
-                vx1, vy1, vx2, vy2 = v["bbox"]
-                if px1 < vx2 and px2 > vx1 and py1 < vy2 and py2 > vy1:
-                    return 1.0
-        return 0.0
-
-    def _run_rl(self, state: np.ndarray) -> Optional[Dict]:
-        if self._rl_agent is None:
-            return None
-        with torch.no_grad():
-            action, _, _ = self._rl_agent.act(state, deterministic=True)
-            logits, _    = self._rl_agent.forward(
-                torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
-            )
-            probs = torch.softmax(logits, dim=-1)[0].cpu().tolist()
-        return {
-            "action": ACTIONS[action],
-            "probs": {ACTIONS[i]: round(probs[i], 4) for i in range(len(ACTIONS))},
-        }
-
-    @staticmethod
-    def _get_brightness(image: Optional[np.ndarray]) -> float:
-        if image is None:
-            return 128.0
-        bmap = image.max(axis=2).astype(np.float32)
-        return float(np.percentile(bmap, 75))
+def _get_brightness(image: Optional[np.ndarray]) -> float:
+    if image is None:
+        return 128.0
+    return float(np.percentile(image.max(axis=2).astype(np.float32), 75))
