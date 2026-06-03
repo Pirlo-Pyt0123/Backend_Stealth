@@ -40,6 +40,7 @@ datasets/jaad_annotations/
 datasets/pedestrian_detection/
 datasets/stanford_drone/
 datasets/vehicle_detection/
+datasets/Real Life Violence Dataset/
 guns-knives-coco/
 guns-knives-yolo/
 

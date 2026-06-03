@@ -77,7 +77,7 @@ PEDESTRIAN_MESSAGES = {
 }
 
 
-# ── Neural network architecture ────────────────────────────────────────────────
+# aqui es donde convertimos detecciones en tokens para el modelo, y donde se hace la inferencia final del riesgo
 class _ObjectTokenEmbedding(nn.Module):
     def __init__(self):
         super().__init__()
@@ -122,7 +122,7 @@ class _SpatialRiskTransformer(nn.Module):
         logits = self.classifier(cls_out)
         return {"logits": logits, "probs": F.softmax(logits, -1)}
 
-
+#  bigru temporal encoder para secuencia de features espaciales (una por frame)
 class _GRUTemporalEncoder(nn.Module):
     def __init__(self):
         super().__init__()

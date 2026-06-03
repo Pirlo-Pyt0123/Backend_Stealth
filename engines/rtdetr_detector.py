@@ -54,7 +54,7 @@ class RTDetrDetector:
         self.model_path = model_path
         self.conf_threshold = conf_threshold
 
-        # Si se especifican clases, usarlas; si no, usar solo persona (legacy)
+        # Si se especifican clases, usarlas; si no, usar solo persona
         if target_class_ids is not None:
             self.target_class_ids = set(target_class_ids)
         else:
