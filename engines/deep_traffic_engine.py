@@ -315,7 +315,6 @@ class DeepTrafficEngine:
         session_id : identifies the GRU frame buffer (one per UE5 session)
         """
         img_h, img_w = image_shape[0], image_shape[1]
-        brightness   = _get_brightness(image)
 
         # ── Enrich TL detections with HSV state ────────────────────────────
         if image is not None:
@@ -387,14 +386,8 @@ class DeepTrafficEngine:
                 "vehiculos":  len(vehicles),
                 "grandes":    len(large_v),
                 "semaforos":  len(tl_dets),
-                "brightness": round(brightness, 1),
-                "is_dark":    brightness < 90,
                 "total_dets": len(detections),
             },
         }
 
 
-def _get_brightness(image: Optional[np.ndarray]) -> float:
-    if image is None:
-        return 128.0
-    return float(np.percentile(image.max(axis=2).astype(np.float32), 75))

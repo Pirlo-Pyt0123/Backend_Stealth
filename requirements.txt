@@ -13,3 +13,8 @@ torchvision>=0.15.0
 # Instalar RF-DETR desde GitHub: pip install git+https://github.com/roboflow/rf-detr.git
 onnx>=1.15.0
 onnxsim>=0.4.0
+
+# Voice narrator — edge-tts (neural, Python 3.14-compatible) + pyttsx3 (fallback)
+# Playback usa Windows MCI via ctypes — sin dependencias extra
+edge-tts>=6.1.9
+pyttsx3>=2.90

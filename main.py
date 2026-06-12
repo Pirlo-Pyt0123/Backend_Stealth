@@ -14,13 +14,16 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, Query
 from fastapi.responses import JSONResponse, StreamingResponse
 import numpy as np
 import cv2
+import base64
 import time
 import io
 import tempfile
 import os
 
-from engines.rtdetr_detector   import RTDetrDetector, TRAFFIC_CLASS_IDS
+from engines.rtdetr_detector     import RTDetrDetector, TRAFFIC_CLASS_IDS
 from engines.deep_traffic_engine import DeepTrafficEngine, RISK_COLORS, TL_COLORS_BGR, SEQ_LEN
+from engines.fight_engine        import FightEngine
+from modules.voice_narrator      import VoiceNarrator, build_narrative
 
 app = FastAPI(
     title="LUCY -- StealthVision AI",
@@ -35,7 +38,10 @@ detector = RTDetrDetector(
     target_class_ids = TRAFFIC_CLASS_IDS,
 )
 
-engine = DeepTrafficEngine()
+engine       = DeepTrafficEngine()
+fight_engine = FightEngine()
+narrator     = VoiceNarrator()
+narrator.wait_until_ready(timeout=30)   # bloquea hasta que edge-tts esté listo
 
 # ── Image loading ─────────────────────────────────────────────────────────────
 def _load_image(data: bytes) -> np.ndarray:
@@ -77,53 +83,32 @@ def _draw_frame(image: np.ndarray, detections: list, result: dict) -> np.ndarray
     level = result["risk_level"]
     color = tuple(RISK_COLORS.get(level, (0, 200, 0)))
 
-    # ── Bounding boxes ────────────────────────────────────────────────────
+    # ── Bounding boxes — solo rectángulos, sin texto ni confianza ────────
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
-        c     = (0, 0, 255) if det["class_id"] == 0 else color
-        label = f"{det['class_name']} {det['confidence']:.2f}"
-
-        # TL colored circle
-        if det["class_id"] == 9 and det.get("tl_state"):
-            tl_col = TL_COLORS_BGR.get(det["tl_state"], (128, 128, 128))
-            cx_tl  = (x1 + x2) // 2
-            cy_tl  = max(y1 - 12, 12)
-            cv2.circle(out, (cx_tl, cy_tl), 10, tl_col, -1)
-            cv2.circle(out, (cx_tl, cy_tl), 10, (255, 255, 255), 1)
-            label = f"TL:{det['tl_state']} {det['confidence']:.2f}"
-
+        c = (0, 0, 255) if det["class_id"] == 0 else color
         cv2.rectangle(out, (x1, y1), (x2, y2), c, 2)
-        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-        cv2.rectangle(out, (x1, y1-th-6), (x1+tw+4, y1), c, -1)
-        cv2.putText(out, label, (x1+2, y1-4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # ── Top banner ────────────────────────────────────────────────────────
-    cv2.rectangle(out, (0, 0), (w, 58), color, -1)
-    conf = result.get("confidence", 0.0)
-    frames_in = result.get("frames_in", 0)
-    ready     = result.get("buffer_ready", False)
-    buf_txt   = f"GRU: {frames_in}/{SEQ_LEN}" if ready else f"warming {frames_in}/{SEQ_LEN}"
-    banner    = f"LUCY: {LEVEL_LABELS.get(level, level)}  ({conf*100:.0f}%)"
-    if result.get("tl_override"):
-        banner += "  [TL OVERRIDE]"
-    cv2.putText(out, banner,
-                (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    probs = result.get("all_probs", {})
-    probs_txt = "  |  ".join(f"{k}: {v:.2f}" for k, v in probs.items())
-    cv2.putText(out, probs_txt + "  " + buf_txt,
-                (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+    # ── Fight bounding boxes — rectángulo naranja-rojo, sin texto ────────
+    if result.get("fight_detected"):
+        FIGHT_COLOR = (0, 60, 255)
+        for (fx1, fy1, fx2, fy2) in result.get("fight_persons", []):
+            cv2.rectangle(out, (fx1, fy1), (fx2, fy2), FIGHT_COLOR, 3)
 
-    # ── Low-light indicator ───────────────────────────────────────────────
-    stats = result.get("stats", {})
-    if stats.get("is_dark"):
-        txt = f"LOW LIGHT  {stats.get('brightness', 0):.0f}/255"
-        (tw, _), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
-        cv2.rectangle(out, (w-tw-12, 0), (w, 20), (20, 20, 100), -1)
-        cv2.putText(out, txt, (w-tw-8, 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 255), 1, cv2.LINE_AA)
+    # ── Top banner — solo nivel de alerta ────────────────────────────────
+    cv2.rectangle(out, (0, 0), (w, 36), color, -1)
+    banner = "PELEA DETECTADA" if result.get("fight_detected") else LEVEL_LABELS.get(level, level)
+    cv2.putText(out, f"LUCY: {banner}",
+                (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
     return out
+
+
+def _encode_frame(image: np.ndarray, detections: list, result: dict) -> str:
+    """Devuelve la imagen anotada como string base64 JPEG."""
+    annotated = _draw_frame(image, detections, result)
+    _, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -135,6 +120,7 @@ def health():
         "version": "5.0.0 -- LUCY TrafficRiskNet",
         "model":   engine._model_name,
         "device":  str(next(engine._model.parameters()).device) if engine._model else "cpu",
+        "voice":  narrator.status,
         "endpoints": {
             "analyze":         "POST /analyze?session_id=default",
             "analyze_visual":  "POST /analyze_visual?session_id=default",
@@ -160,7 +146,14 @@ async def analyze(
         t0     = time.time()
         dets   = detector.detect(image)
         result = engine.analyze(dets, image.shape, image=image, session_id=session_id)
-        dt     = (time.time() - t0) * 1000.0
+        fight  = fight_engine.analyze(image, session_id)
+        result.update(fight)
+        if fight["fight_detected"]:
+            result["risk_level"]   = "CRITICAL"
+            result["color_alerta"] = list(RISK_COLORS["CRITICAL"])
+        narrator.speak(result)
+        dt        = (time.time() - t0) * 1000.0
+        narrative = build_narrative(result)
 
         return JSONResponse({
             # UE5-compatible keys (same as v4)
@@ -179,6 +172,11 @@ async def analyze(
             "seq_len":           result["seq_len"],
             "model_name":        result["model_name"],
             "stats":             result["stats"],
+            "narrative":         narrative,
+            # Fight detection
+            "fight_detected":    fight["fight_detected"],
+            "fight_confidence":  fight["fight_confidence"],
+            "fight_ready":       fight["fight_ready"],
             "todas_detecciones": dets,
             "inference_time_ms": round(dt, 2),
             "image_shape":       {"height": image.shape[0], "width": image.shape[1]},
@@ -199,6 +197,9 @@ async def analyze_visual(
         image  = _load_image(await file.read())
         dets   = detector.detect(image)
         result = engine.analyze(dets, image.shape, image=image, session_id=session_id)
+        fight  = fight_engine.analyze(image, session_id)
+        result.update(fight)
+        narrator.speak(result)
         out    = _draw_frame(image, dets, result)
         _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
         return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
@@ -210,8 +211,9 @@ async def analyze_visual(
 
 @app.post("/traffic/reset")
 async def traffic_reset(session_id: str = Query(default="default")):
-    """Reset the GRU frame buffer for a session (new scene in UE5)."""
+    """Reset the GRU and fight frame buffers for a session (new scene in UE5)."""
     engine.reset(session_id)
+    fight_engine.reset(session_id)
     return {"status": "ok", "session_id": session_id, "message": "Buffer cleared"}
 
 
@@ -247,6 +249,13 @@ async def security_compat(
         t0     = time.time()
         dets   = detector.detect(image)
         result = engine.analyze(dets, image.shape, image=image, session_id=session_id)
+        fight  = fight_engine.analyze(image, session_id)
+        result.update(fight)
+        # Pelea fuerza CRITICAL para que Unreal suba el widget de alerta
+        if fight["fight_detected"]:
+            result["risk_level"]   = "CRITICAL"
+            result["color_alerta"] = list(RISK_COLORS["CRITICAL"])
+        narrator.speak(result)
         dt     = (time.time() - t0) * 1000.0
         stats  = result.get("stats", {})
 
@@ -260,11 +269,15 @@ async def security_compat(
             "rl_action":     result["risk_level"],
             "weapons_found": 0,
             "persons_found": stats.get("personas", 0),
-            "brightness":    stats.get("brightness", 128.0),
-            "is_dark":       stats.get("is_dark", False),
             "buffer_ready":  result["buffer_ready"],
             "frame":         result["frames_in"],
             "session_id":    session_id,
+            # Fight detection — para el widget de pelea en Unreal
+            "fight_detected":   fight["fight_detected"],
+            "fight_confidence": fight["fight_confidence"],
+            "fight_ready":      fight["fight_ready"],
+            # Imagen anotada con bounding boxes (base64 JPEG) para el overlay de Unreal
+            "annotated_frame":   _encode_frame(image, dets, result),
             "todas_detecciones": dets,
             "inference_time_ms": round(dt, 2),
             "image_shape":   {"height": image.shape[0], "width": image.shape[1]},
@@ -287,6 +300,9 @@ async def security_visual_compat(
         image  = _load_image(await file.read())
         dets   = detector.detect(image)
         result = engine.analyze(dets, image.shape, image=image, session_id=session_id)
+        fight  = fight_engine.analyze(image, session_id)
+        result.update(fight)
+        narrator.speak(result)
         out    = _draw_frame(image, dets, result)
         _, buf = cv2.imencode(".jpg", out, [cv2.IMWRITE_JPEG_QUALITY, 90])
         return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/jpeg")
@@ -300,6 +316,14 @@ async def security_visual_compat(
 async def security_reset_compat(session_id: str = Query(default="default")):
     """Compatibility stub for /security/reset."""
     engine.reset(session_id)
+    fight_engine.reset(session_id)
+    return {"status": "ok", "session_id": session_id}
+
+
+@app.post("/fight/reset")
+async def fight_reset(session_id: str = Query(default="default")):
+    """Reset the fight detection frame buffer for a session."""
+    fight_engine.reset(session_id)
     return {"status": "ok", "session_id": session_id}
 
 
