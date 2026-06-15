@@ -83,17 +83,26 @@ def _draw_frame(image: np.ndarray, detections: list, result: dict) -> np.ndarray
     level = result["risk_level"]
     color = tuple(RISK_COLORS.get(level, (0, 200, 0)))
 
-    # ── Bounding boxes — solo rectángulos, sin texto ni confianza ────────
+    # ── Bounding boxes — clase sin confianza ─────────────────────────────
     for det in detections:
         x1, y1, x2, y2 = det["bbox"]
-        c = (0, 0, 255) if det["class_id"] == 0 else color
+        c     = (0, 0, 255) if det["class_id"] == 0 else color
+        label = det["class_name"]
         cv2.rectangle(out, (x1, y1), (x2, y2), c, 2)
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        cv2.rectangle(out, (x1, y1-th-6), (x1+tw+4, y1), c, -1)
+        cv2.putText(out, label, (x1+2, y1-4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-    # ── Fight bounding boxes — rectángulo naranja-rojo, sin texto ────────
+    # ── Fight bounding boxes — naranja-rojo con etiqueta ─────────────────
     if result.get("fight_detected"):
         FIGHT_COLOR = (0, 60, 255)
         for (fx1, fy1, fx2, fy2) in result.get("fight_persons", []):
             cv2.rectangle(out, (fx1, fy1), (fx2, fy2), FIGHT_COLOR, 3)
+            (tw, th), _ = cv2.getTextSize("pelea", cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(out, (fx1, fy1-th-6), (fx1+tw+4, fy1), FIGHT_COLOR, -1)
+            cv2.putText(out, "pelea", (fx1+2, fy1-4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
     # ── Top banner — solo nivel de alerta ────────────────────────────────
     cv2.rectangle(out, (0, 0), (w, 36), color, -1)

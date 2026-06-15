@@ -29,8 +29,8 @@ COCO_CLASSES = {
 }
 
 # Clases relevantes para educacion vial
-TRAFFIC_CLASS_IDS = {0, 1, 2, 3, 5, 7, 9, 11}
-# 0=person, 1=bicycle, 2=car, 3=motorcycle, 5=bus, 7=truck, 9=traffic light, 11=stop sign
+TRAFFIC_CLASS_IDS = {0, 2, 3, 5, 7, 9, 11}
+# 0=person, 2=car, 3=motorcycle, 5=bus, 7=truck, 9=traffic light, 11=stop sign
 
 
 class RTDetrDetector:
